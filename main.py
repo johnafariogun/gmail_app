@@ -1,8 +1,11 @@
 import os
 import json
-from typing import Optional
+import base64
+from datetime import datetime
+from typing import Optional, List
+
+from fastapi import FastAPI, Request, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi import FastAPI, Request, HTTPException
 from starlette.responses import RedirectResponse, HTMLResponse
 
 from google.oauth2.credentials import Credentials
@@ -11,10 +14,19 @@ from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
-from sqlalchemy import create_engine, Column, String, Text
+from sqlalchemy import (
+    create_engine,
+    Column,
+    String,
+    Text,
+    DateTime,
+    desc,
+)
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
+
 from dotenv import load_dotenv
+
 load_dotenv()
 
 # ===========================
@@ -24,14 +36,13 @@ SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
 GOOGLE_CLIENT_CONFIG = os.getenv("GOOGLE_CLIENT_CONFIG")
 MYSQL_URL = os.getenv("MYSQL_URL")
 REDIRECT_URI = os.getenv("REDIRECT_URI", "http://localhost:8000/redirect_uri")
+
 if not GOOGLE_CLIENT_CONFIG:
     raise RuntimeError("Missing GOOGLE_CLIENT_CONFIG environment variable")
 
 if not MYSQL_URL:
     raise RuntimeError("Missing MYSQL_URL environment variable")
 
-if not REDIRECT_URI:
-    raise RuntimeError("Missing REDIRECT_URI environment variable")
 client_config = json.loads(GOOGLE_CLIENT_CONFIG)
 
 # SQLAlchemy setup
@@ -39,9 +50,8 @@ Base = declarative_base()
 engine = create_engine(MYSQL_URL)
 SessionLocal = sessionmaker(bind=engine)
 
-
 # ===========================
-# DATABASE MODEL
+# DATABASE MODELS
 # ===========================
 class Token(Base):
     __tablename__ = "tokens"
@@ -49,13 +59,22 @@ class Token(Base):
     token_json = Column(Text, nullable=False)
 
 
-Base.metadata.create_all(bind=engine)
+class Email(Base):
+    __tablename__ = "emails"
+    id = Column(String(255), primary_key=True)
+    subject = Column(String(500))
+    sender = Column(String(500))
+    snippet = Column(Text)
+    date = Column(DateTime)
+    body = Column(Text)
 
+
+Base.metadata.create_all(bind=engine)
 
 # ===========================
 # FASTAPI SETUP
 # ===========================
-app = FastAPI(title="Gmail API FastAPI Wrapper with MySQL Storage")
+app = FastAPI(title="Gmail API + MySQL Email Store")
 
 app.add_middleware(
     CORSMiddleware,
@@ -67,12 +86,10 @@ app.add_middleware(
 
 flows: dict[str, Flow] = {}
 
-
 # ===========================
-# HELPER FUNCTIONS
+# HELPERS
 # ===========================
 def save_credentials_to_db(user_id: str, creds: Credentials):
-    """Store credentials JSON in MySQL."""
     db = SessionLocal()
     creds_json = creds.to_json()
     token = db.query(Token).filter(Token.user_id == user_id).first()
@@ -86,7 +103,6 @@ def save_credentials_to_db(user_id: str, creds: Credentials):
 
 
 def load_credentials_from_db(user_id: str) -> Optional[Credentials]:
-    """Load credentials from MySQL if available."""
     db = SessionLocal()
     token = db.query(Token).filter(Token.user_id == user_id).first()
     db.close()
@@ -99,26 +115,40 @@ def build_gmail_service(creds: Credentials):
     return build("gmail", "v1", credentials=creds)
 
 
+def decode_body(payload):
+    """Extract plain text body from Gmail message payload"""
+    def walk_parts(part):
+        if part.get("parts"):
+            for p in part["parts"]:
+                text = walk_parts(p)
+                if text:
+                    return text
+        elif part["mimeType"] == "text/plain":
+            data = part["body"].get("data")
+            if data:
+                return base64.urlsafe_b64decode(data).decode("utf-8", errors="ignore")
+        return None
+
+    return walk_parts(payload)
+
+
 # ===========================
 # ROUTES
 # ===========================
 @app.get("/authorize")
 def authorize():
-    """Start the OAuth flow and redirect the user to Google's auth page."""
     flow = Flow.from_client_config(client_config, scopes=SCOPES)
     flow.redirect_uri = REDIRECT_URI
 
     auth_url, state = flow.authorization_url(
         access_type="offline", include_granted_scopes="true", prompt="consent"
     )
-
     flows[state] = flow
     return RedirectResponse(auth_url)
 
 
 @app.get("/redirect_uri")
 async def oauth2callback(request: Request):
-    """OAuth2 callback endpoint specified in Google Cloud Console."""
     params = request.query_params
     state = params.get("state")
     if not state:
@@ -128,33 +158,23 @@ async def oauth2callback(request: Request):
     if flow is None:
         raise HTTPException(status_code=400, detail="Unknown or expired OAuth state")
 
-    full_url = str(request.url)
     try:
-        flow.fetch_token(authorization_response=full_url)
+        flow.fetch_token(authorization_response=str(request.url))
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to fetch token: {e}")
 
     creds = flow.credentials
     save_credentials_to_db("me", creds)
 
-    # Fetch labels for confirmation
-    try:
-        service = build_gmail_service(creds)
-        results = service.users().labels().list(userId="me").execute()
-        labels = results.get("labels", [])
-    except HttpError:
-        labels = []
-
     html = "<h2>Authorization complete</h2>"
-    html += "<p>Credentials stored in MySQL.</p>"
-    html += "<p><a href=\"/labels\">View labels</a></p>"
-    html += "<pre>{}</pre>".format(json.dumps(labels, indent=2))
+    html += "<p>Credentials saved to MySQL.</p>"
+    html += "<p><a href=\"/refresh\">Fetch emails</a></p>"
     return HTMLResponse(content=html)
 
 
-@app.get("/labels")
-def list_labels():
-    """Return the user's Gmail labels as JSON."""
+@app.get("/refresh")
+def refresh_emails():
+    """Fetch latest emails from Gmail and save to MySQL."""
     creds = load_credentials_from_db("me")
     if not creds:
         return RedirectResponse("/authorize")
@@ -166,14 +186,81 @@ def list_labels():
         else:
             return RedirectResponse("/authorize")
 
+    db = SessionLocal()
     try:
         service = build_gmail_service(creds)
-        results = service.users().labels().list(userId="me").execute()
-        labels = results.get("labels", [])
-        return {"labels": labels}
-    except HttpError as error:
-        raise HTTPException(status_code=500, detail=str(error))
+        results = service.users().messages().list(userId="me", maxResults=20).execute()
+        messages = results.get("messages", [])
 
+        for msg in messages:
+            detail = (
+                service.users()
+                .messages()
+                .get(userId="me", id=msg["id"], format="full")
+                .execute()
+            )
+
+            headers = detail["payload"].get("headers", [])
+            subject = next((h["value"] for h in headers if h["name"] == "Subject"), "(No Subject)")
+            sender = next((h["value"] for h in headers if h["name"] == "From"), "(Unknown Sender)")
+            date_str = next((h["value"] for h in headers if h["name"] == "Date"), "")
+            date = None
+            try:
+                date = datetime.strptime(date_str[:25], "%a, %d %b %Y %H:%M:%S")
+            except Exception:
+                pass
+
+            snippet = detail.get("snippet", "")
+            body = decode_body(detail.get("payload", {})) or ""
+
+            existing = db.query(Email).filter(Email.id == msg["id"]).first()
+            if not existing:
+                email = Email(
+                    id=msg["id"],
+                    subject=subject,
+                    sender=sender,
+                    snippet=snippet,
+                    date=date,
+                    body=body,
+                )
+                db.add(email)
+
+        db.commit()
+        return {"status": "Emails refreshed successfully"}
+
+    except HttpError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
+
+
+@app.get("/emails")
+def get_emails(
+    sort: Optional[str] = Query("desc", description="Sort by date: asc or desc"),
+    limit: Optional[int] = Query(10, description="Number of emails to return"),
+):
+    """Return emails stored in MySQL, sorted by date."""
+    db = SessionLocal()
+    query = db.query(Email)
+
+    if sort == "asc":
+        query = query.order_by(Email.date)
+    else:
+        query = query.order_by(desc(Email.date))
+
+    emails = query.limit(limit).all()
+    db.close()
+
+    return [
+        {
+            "id": e.id,
+            "subject": e.subject,
+            "from": e.sender,
+            "snippet": e.snippet,
+            "date": e.date,
+        }
+        for e in emails
+    ]
 
 # ===========================
 # RUN LOCALLY
